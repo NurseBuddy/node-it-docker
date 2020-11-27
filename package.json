@@ -1,0 +1,17 @@
+{
+  "name": "node-it-docker",
+  "version": "1.0.0",
+  "description": "Node Docker IT DB launcher",
+  "main": "node-it-docker",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Nursebuddy",
+  "license": "ISC",
+  "private": true,
+  "dependencies": {
+    "mysql": "^2.18.1",
+    "node-docker-api": "^1.1.22",
+    "pino": "^6.7.0"
+  }
+}
