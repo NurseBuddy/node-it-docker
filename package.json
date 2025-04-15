@@ -1,6 +1,6 @@
 {
   "name": "node-it-docker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Node Docker IT DB launcher",
   "main": "node-it-docker",
   "scripts": {
@@ -10,8 +10,8 @@
   "license": "ISC",
   "private": true,
   "dependencies": {
+    "dockerode": "^4.0.5",
     "mysql": "^2.18.1",
-    "node-docker-api": "^1.1.22",
     "pino": "^6.7.0"
   }
 }
