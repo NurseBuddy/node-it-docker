@@ -12,54 +12,79 @@ const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 
 const LOCALHOST = '127.0.0.1';
 const MYSQL_DEFAULT_PORT = '3306';
+const DEFAULT_IT_IMAGE_NAME = '989173062527.dkr.ecr.eu-west-1.amazonaws.com/it-mysql-v2';
+const DEFAULT_IT_CONTAINER_NAME = 'node-it-container-qwerty12345';
+const DEFAULT_CONTAINER_NETWORK_NAME = 'node-it-test-net';
+const DEFAULT_EXTERNAL_PORT = 3806;
 
 async function sleep(timeMs) {
   return new Promise(resolve => setTimeout(resolve, timeMs));
 }
 
-async function connectRunningContainerToNetwork(currentContainerId, network) {
+function createRunId() {
+  return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function hasOption(options, key) {
+  return Object.prototype.hasOwnProperty.call(options, key);
+}
+
+function isDynamicHostPort(externalPort) {
+  return externalPort === 0 || externalPort === '0' || externalPort === null;
+}
+
+function createLabels(runId) {
+  return {
+    'com.nursebuddy.integration-test': 'node-it-docker',
+    'com.nursebuddy.integration-test.runner': 'node-it-docker',
+    'com.nursebuddy.integration-test.run-id': runId,
+  };
+}
+
+async function connectRunningContainerToNetwork(currentContainerId, network, logger) {
   if (currentContainerId) {
-    log.info(`Connecting the current container ('${currentContainerId}') to the IT DB network.`);
+    logger.info(`Connecting the current container ('${currentContainerId}') to the IT DB network.`);
     await network.connect({ Container: currentContainerId });
   }
 }
 
-async function disconnectRunningContainerFromNetwork(currentContainerId, network) {
+async function disconnectRunningContainerFromNetwork(currentContainerId, network, logger) {
   if (currentContainerId) {
-    log.info(`Disconnecting the current container ('${currentContainerId}') from the IT DB network.`);
+    logger.info(`Disconnecting the current container ('${currentContainerId}') from the IT DB network.`);
     await network.disconnect({ Container: currentContainerId, Force: true });
   }
 }
 
-async function getOrCreateNetwork(containerNetworkName) {
+async function getOrCreateNetwork(dockerClient, containerNetworkName, labels, logger) {
   let network;
   try {
-    const existingNetworks = await docker.listNetworks();
+    const existingNetworks = await dockerClient.listNetworks();
     const found = existingNetworks.find(n => n.Name === containerNetworkName);
     if (found) {
-      network = docker.getNetwork(found.Id);
+      network = dockerClient.getNetwork(found.Id);
     }
   } catch (err) {
-    log.debug('Failed to list docker networks.', err);
+    logger.debug('Failed to list docker networks.', err);
   }
 
   if (!network) {
-    log.info('No existing network, creating it.');
-    network = await docker.createNetwork({
+    logger.info('No existing network, creating it.');
+    network = await dockerClient.createNetwork({
       Name: containerNetworkName,
       CheckDuplicate: true,
       Attachable: true,
+      Labels: labels,
     });
-    network = docker.getNetwork(network.id);
-    log.info(`Network '${containerNetworkName}' created`);
+    network = dockerClient.getNetwork(network.id);
+    logger.info(`Network '${containerNetworkName}' created`);
   }
 
   return network;
 }
 
-async function connect(externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName) {
+async function connect(mysqlClient, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName) {
   return new Promise((resolve, reject) => {
-    const connection = mysql.createConnection({
+    const connection = mysqlClient.createConnection({
       host: currentContainerId ? itContainerName : LOCALHOST,
       port: currentContainerId ? MYSQL_DEFAULT_PORT : externalPort,
       user: dbUsername,
@@ -72,7 +97,7 @@ async function connect(externalPort, currentContainerId, itContainerName, dbUser
 
       connection.query('SELECT id AS id FROM integration_test_flag LIMIT 1', (err, res) => {
         connection.destroy();
-        if (err || res.length !== 1) {
+        if (err || !res || res.length !== 1) {
           return reject(err || { msg: 'Invalid length' });
         }
         return resolve(true);
@@ -81,86 +106,135 @@ async function connect(externalPort, currentContainerId, itContainerName, dbUser
   });
 }
 
-async function verifyDatabaseConnection(verifyDbConnection, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stopFn) {
+async function verifyDatabaseConnection(verifyDbConnection, mysqlClient, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stopFn, logger, sleepFn) {
   let lastError;
   let waitPeriod = 500;
   const start = Date.now();
 
-  if (verifyDbConnection) {
-    for (let i = 0; i < 10; i++) {
-      try {
-        if (await connect(externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName)) {
-          log.info(`DB Connection verified in : ${Date.now() - start} ms.`);
-          return true;
-        }
-      } catch (err) {
-        lastError = err;
-      }
-      await sleep(waitPeriod);
-      waitPeriod += Math.round(waitPeriod / 2);
-    }
-
-    log.warn({ msg: 'DB connection failed:', error: lastError });
-    await stopFn();
-    return false;
+  if (!verifyDbConnection) {
+    return true;
   }
+
+  for (let i = 0; i < 10; i++) {
+    try {
+      if (await connect(mysqlClient, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName)) {
+        logger.info(`DB Connection verified in : ${Date.now() - start} ms.`);
+        return true;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+    await sleepFn(waitPeriod);
+    waitPeriod += Math.round(waitPeriod / 2);
+  }
+
+  logger.warn({ msg: 'DB connection failed:', error: lastError });
+  await stopFn();
+  return false;
 }
 
-const NodeItDocker = ({
-  itImageName = '989173062527.dkr.ecr.eu-west-1.amazonaws.com/it-mysql-v2',
-  itContainerName = 'node-it-container-qwerty12345',
-  externalPort = 3806,
-  containerNetworkName = 'node-it-test-net',
-  dataDir = '/var/lib/mysql',
-  currentContainerId = null,
-  verifyDbConnection = true,
-  dbUsername = 'ituser',
-  dbPassword = 'ituser',
-  dbName = 'nursebuddy',
-}) => {
-  currentContainerId = process.env.IT_CONTAINER || currentContainerId || null;
-  itImageName = process.env.IT_IMAGE_NAME || itImageName;
+async function resolveExternalPort(container, externalPort, currentContainerId) {
+  if (currentContainerId) {
+    return MYSQL_DEFAULT_PORT;
+  }
 
-  return {
-    stop: async () => {
+  if (!isDynamicHostPort(externalPort)) {
+    return externalPort;
+  }
+
+  const inspected = await container.inspect();
+  const bindings = inspected
+    && inspected.NetworkSettings
+    && inspected.NetworkSettings.Ports
+    && inspected.NetworkSettings.Ports[`${MYSQL_DEFAULT_PORT}/tcp`];
+
+  if (!bindings || !bindings[0] || !bindings[0].HostPort) {
+    throw new Error(`Failed to resolve dynamic Docker host port for MySQL port ${MYSQL_DEFAULT_PORT}.`);
+  }
+
+  return bindings[0].HostPort;
+}
+
+function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger = log, sleepFn = sleep) {
+  return function NodeItDocker(options = {}) {
+    const runId = createRunId();
+    const useDynamicDefaults = options.useDynamicDefaults === true || options.dynamicPort === true;
+    const configuredExternalPort = hasOption(options, 'externalPort')
+      ? options.externalPort
+      : (options.dynamicPort === true ? 0 : DEFAULT_EXTERNAL_PORT);
+
+    const itContainerName = options.itContainerName
+      || (useDynamicDefaults ? `node-it-container-${runId}` : DEFAULT_IT_CONTAINER_NAME);
+    const containerNetworkName = options.containerNetworkName
+      || (useDynamicDefaults ? `node-it-test-net-${runId}` : DEFAULT_CONTAINER_NETWORK_NAME);
+    const dataDir = options.dataDir || '/var/lib/mysql';
+    const verifyDbConnection = hasOption(options, 'verifyDbConnection') ? options.verifyDbConnection : true;
+    const dbUsername = options.dbUsername || 'ituser';
+    const dbPassword = options.dbPassword || 'ituser';
+    const dbName = options.dbName || 'nursebuddy';
+    const labels = createLabels(runId);
+    let currentContainerId = process.env.IT_CONTAINER || options.currentContainerId || null;
+    let itImageName = process.env.IT_IMAGE_NAME || process.env.IT_MYSQL_IMAGE || options.itImageName || DEFAULT_IT_IMAGE_NAME;
+    let resolvedExternalPort = configuredExternalPort;
+
+    function getDbConnectionParameters() {
+      return {
+        host: currentContainerId ? itContainerName : LOCALHOST,
+        port: currentContainerId ? MYSQL_DEFAULT_PORT : resolvedExternalPort,
+        user: dbUsername,
+        password: dbPassword,
+        database: dbName,
+      };
+    }
+
+    async function stop() {
       try {
-        const container = docker.getContainer(itContainerName);
+        const container = dockerClient.getContainer(itContainerName);
         await container.stop();
         await container.remove({ force: true });
-
-        const network = docker.getNetwork(containerNetworkName);
-        if (currentContainerId) {
-          await disconnectRunningContainerFromNetwork(currentContainerId, network);
-        }
-        await network.remove({ force: true });
-        log.info('Container stopped.');
       } catch (err) {
-        log.warn('Failed to stop container or network:', err);
+        logger.warn('Failed to stop or remove container:', err);
       }
-    },
-
-    start: async () => {
-      let container;
-      let network = await getOrCreateNetwork(containerNetworkName);
 
       try {
-        container = docker.getContainer(itContainerName);
-        await container.inspect();
+        const network = dockerClient.getNetwork(containerNetworkName);
+        if (currentContainerId) {
+          await disconnectRunningContainerFromNetwork(currentContainerId, network, logger);
+        }
+        await network.remove({ force: true });
+        logger.info('Container stopped.');
+      } catch (err) {
+        logger.warn('Failed to remove network:', err);
+      }
+    }
+
+    async function start() {
+      let container;
+      let inspected;
+      const network = await getOrCreateNetwork(dockerClient, containerNetworkName, labels, logger);
+
+      try {
+        container = dockerClient.getContainer(itContainerName);
+        inspected = await container.inspect();
       } catch {
-        log.info('Creating container');
-        container = await docker.createContainer({
+        logger.info('Creating container');
+        container = await dockerClient.createContainer({
           Image: itImageName,
           name: itContainerName,
+          Labels: labels,
+          ExposedPorts: {
+            [`${MYSQL_DEFAULT_PORT}/tcp`]: {},
+          },
           HostConfig: {
             PortBindings: {
               [`${MYSQL_DEFAULT_PORT}/tcp`]: [{
                 HostIP: '0.0.0.0',
-                HostPort: `${externalPort}`,
+                HostPort: isDynamicHostPort(configuredExternalPort) ? '' : `${configuredExternalPort}`,
               }],
             },
             Tmpfs: {
               [dataDir]: 'rw,noexec,nosuid,size=600m',
-              '/tmp': 'rw,noexec,nosuid,size=50m'
+              '/tmp': 'rw,noexec,nosuid,size=50m',
             },
           },
           NetworkingConfig: {
@@ -171,55 +245,53 @@ const NodeItDocker = ({
             },
           },
         });
-        container = docker.getContainer(container.id);
-        log.info(`Container '${container.id}' created.`);
+        container = dockerClient.getContainer(container.id);
+        logger.info(`Container '${container.id}' created.`);
       }
 
-      await container.start();
-      await connectRunningContainerToNetwork(currentContainerId, network);
-
-      if (await verifyDatabaseConnection(verifyDbConnection, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, this.stop)) {
-        return {
-          host: currentContainerId ? itContainerName : LOCALHOST,
-          port: currentContainerId ? MYSQL_DEFAULT_PORT : externalPort,
-          user: dbUsername,
-          password: dbPassword,
-          database: dbName,
-        };
-      }
-      return null;
-    },
-
-    restart: async () => {
       try {
-        const container = docker.getContainer(itContainerName);
-        await container.restart();
-        if (await verifyDatabaseConnection(verifyDbConnection, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, this.stop)) {
-          return {
-            host: currentContainerId ? itContainerName : LOCALHOST,
-            port: currentContainerId ? MYSQL_DEFAULT_PORT : externalPort,
-            user: dbUsername,
-            password: dbPassword,
-            database: dbName,
-          };
+        if (!inspected || !inspected.State || !inspected.State.Running) {
+          await container.start();
+        }
+
+        await connectRunningContainerToNetwork(currentContainerId, network, logger);
+        resolvedExternalPort = await resolveExternalPort(container, configuredExternalPort, currentContainerId);
+
+        if (await verifyDatabaseConnection(verifyDbConnection, mysqlClient, resolvedExternalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stop, logger, sleepFn)) {
+          return getDbConnectionParameters();
         }
         return null;
       } catch (err) {
-        log.warn('Restart failed, starting new container.', err);
-        return this.start();
+        logger.warn('Failed to start container:', err);
+        await stop();
+        throw err;
       }
-    },
+    }
 
-    getDbConnectionParameters: async () => {
-      return {
-        host: currentContainerId ? itContainerName : LOCALHOST,
-        port: currentContainerId ? MYSQL_DEFAULT_PORT : externalPort,
-        user: dbUsername,
-        password: dbPassword,
-        database: dbName,
-      };
-    },
+    async function restart() {
+      try {
+        const container = dockerClient.getContainer(itContainerName);
+        await container.restart();
+        resolvedExternalPort = await resolveExternalPort(container, configuredExternalPort, currentContainerId);
+        if (await verifyDatabaseConnection(verifyDbConnection, mysqlClient, resolvedExternalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stop, logger, sleepFn)) {
+          return getDbConnectionParameters();
+        }
+        return null;
+      } catch (err) {
+        logger.warn('Restart failed, starting new container.', err);
+        await stop();
+        return start();
+      }
+    }
+
+    return {
+      stop,
+      start,
+      restart,
+      getDbConnectionParameters: async () => getDbConnectionParameters(),
+    };
   };
-};
+}
 
-exports.NodeItDocker = NodeItDocker;
+exports.createNodeItDocker = createNodeItDocker;
+exports.NodeItDocker = createNodeItDocker();
