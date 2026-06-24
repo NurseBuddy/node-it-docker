@@ -9,7 +9,7 @@ dynamic mode for parallel and CI-safe test runs.
 ## Install
 
 ```bash
-yarn install
+npm install https://github.com/NurseBuddy/node-it-docker/archive/v1.2.0.tar.gz
 ```
 
 ## Usage

@@ -41,10 +41,23 @@ function createLabels(runId) {
   };
 }
 
+function isAlreadyConnectedNetworkError(err) {
+  const message = err && err.message ? err.message : `${err}`;
+  return /already connected|endpoint .*already exists|endpoint with name .* already exists/i.test(message);
+}
+
 async function connectRunningContainerToNetwork(currentContainerId, network, logger) {
   if (currentContainerId) {
     logger.info(`Connecting the current container ('${currentContainerId}') to the IT DB network.`);
-    await network.connect({ Container: currentContainerId });
+    try {
+      await network.connect({ Container: currentContainerId });
+    } catch (err) {
+      if (isAlreadyConnectedNetworkError(err)) {
+        logger.info(`Current container ('${currentContainerId}') is already connected to the IT DB network.`);
+        return;
+      }
+      throw err;
+    }
   }
 }
 
@@ -205,7 +218,11 @@ function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger =
       try {
         const network = dockerClient.getNetwork(containerNetworkName);
         if (currentContainerId) {
-          await disconnectRunningContainerFromNetwork(currentContainerId, network, logger);
+          try {
+            await disconnectRunningContainerFromNetwork(currentContainerId, network, logger);
+          } catch (err) {
+            logger.warn('Failed to disconnect current container from network:', err);
+          }
         }
         await network.remove({ force: true });
         logger.info('Container stopped.');

@@ -42,10 +42,17 @@ function createDockerStub() {
       removed: false,
       connected: [],
       disconnected: [],
+      disconnectError: null,
       async connect(opts) {
+        if (this.connected.some(item => item.Container === opts.Container)) {
+          throw new Error(`endpoint with name ${opts.Container} already exists in network ${name}`);
+        }
         this.connected.push(opts);
       },
       async disconnect(opts) {
+        if (this.disconnectError) {
+          throw this.disconnectError;
+        }
         this.disconnected.push(opts);
       },
       async remove(opts) {
@@ -144,7 +151,20 @@ function createDockerStub() {
       const network = networks.get(nameOrId);
       if (network) return network;
 
-      return makeNetwork(nameOrId, nameOrId);
+      return {
+        async connect() {
+          calls.push(['network.connect', nameOrId]);
+          throw new Error('network not found');
+        },
+        async disconnect() {
+          calls.push(['network.disconnect', nameOrId]);
+          throw new Error('network not found');
+        },
+        async remove(opts) {
+          calls.push(['network.remove', nameOrId, opts]);
+          throw new Error('network not found');
+        },
+      };
     },
     async createContainer(options) {
       calls.push(['createContainer', options]);
@@ -286,6 +306,21 @@ test('returns docker-network connection parameters when running inside a contain
   assert.deepEqual(network.connected, [{ Container: 'current-test-container' }]);
 });
 
+test('start is idempotent when the current container is already connected to the network', async () => {
+  const { docker, nodeItDocker } = createSubject({
+    currentContainerId: 'current-test-container',
+    itContainerName: 'mysql-service',
+    verifyDbConnection: false,
+  });
+
+  const first = await nodeItDocker.start();
+  const second = await nodeItDocker.start();
+  const network = Array.from(docker.networks.values()).find(item => item.name === 'node-it-test-net');
+
+  assert.deepEqual(second, first);
+  assert.deepEqual(network.connected, [{ Container: 'current-test-container' }]);
+});
+
 test('uses IT_IMAGE_NAME before IT_MYSQL_IMAGE and constructor image', async () => {
   const originalImageName = process.env.IT_IMAGE_NAME;
   const originalMysqlImage = process.env.IT_MYSQL_IMAGE;
@@ -398,6 +433,22 @@ test('stop removes the container even when stop fails and can be repeated', asyn
   await nodeItDocker.stop();
 
   assert.ok(docker.calls.some(([name]) => name === 'container.remove'));
+  assert.ok(docker.calls.some(([name]) => name === 'network.remove'));
+});
+
+test('stop removes the network even when disconnecting the current container fails', async () => {
+  const { docker, nodeItDocker } = createSubject({
+    currentContainerId: 'current-test-container',
+    verifyDbConnection: false,
+  });
+
+  await nodeItDocker.start();
+  const network = Array.from(docker.networks.values()).find(item => item.name === 'node-it-test-net');
+  network.disconnectError = new Error('endpoint not found');
+
+  await nodeItDocker.stop();
+
+  assert.ok(network.removed);
   assert.ok(docker.calls.some(([name]) => name === 'network.remove'));
 });
 
