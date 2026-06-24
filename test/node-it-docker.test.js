@@ -52,6 +52,7 @@ function createDockerStub() {
         calls.push(['network.remove', name, opts]);
         this.removed = true;
         networks.delete(name);
+        networks.delete(id);
       },
     };
   }
@@ -73,6 +74,7 @@ function createDockerStub() {
       started: false,
       stopped: false,
       removed: false,
+      stopError: null,
       restartError: null,
       async inspect() {
         calls.push(['container.inspect', name]);
@@ -99,6 +101,9 @@ function createDockerStub() {
       },
       async stop() {
         calls.push(['container.stop', name]);
+        if (this.stopError) {
+          throw this.stopError;
+        }
         this.stopped = true;
         this.started = false;
       },
@@ -122,6 +127,7 @@ function createDockerStub() {
     calls,
     containers,
     networks,
+    createContainerError: null,
     async listNetworks() {
       calls.push(['listNetworks']);
       return Array.from(networks.values()).map(network => ({ Id: network.id, Name: network.name }));
@@ -142,6 +148,9 @@ function createDockerStub() {
     },
     async createContainer(options) {
       calls.push(['createContainer', options]);
+      if (this.createContainerError) {
+        throw this.createContainerError;
+      }
       const container = makeContainer(options);
       containers.set(options.name, container);
       containers.set(container.id, container);
@@ -308,6 +317,37 @@ test('uses IT_IMAGE_NAME before IT_MYSQL_IMAGE and constructor image', async () 
   }
 });
 
+test('uses IT_MYSQL_IMAGE when legacy IT_IMAGE_NAME is not set', async () => {
+  const originalImageName = process.env.IT_IMAGE_NAME;
+  const originalMysqlImage = process.env.IT_MYSQL_IMAGE;
+  delete process.env.IT_IMAGE_NAME;
+  process.env.IT_MYSQL_IMAGE = 'env-mysql-image';
+
+  try {
+    const { docker, nodeItDocker } = createSubject({
+      itImageName: 'constructor-image',
+      verifyDbConnection: false,
+    });
+
+    await nodeItDocker.start();
+    const createContainerCall = docker.calls.find(([name]) => name === 'createContainer');
+
+    assert.equal(createContainerCall[1].Image, 'env-mysql-image');
+  } finally {
+    if (originalImageName === undefined) {
+      delete process.env.IT_IMAGE_NAME;
+    } else {
+      process.env.IT_IMAGE_NAME = originalImageName;
+    }
+
+    if (originalMysqlImage === undefined) {
+      delete process.env.IT_MYSQL_IMAGE;
+    } else {
+      process.env.IT_MYSQL_IMAGE = originalMysqlImage;
+    }
+  }
+});
+
 test('falls back to start when restart fails without using method this binding', async () => {
   const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
 
@@ -324,6 +364,62 @@ test('falls back to start when restart fails without using method this binding',
   );
 });
 
+test('successful restart returns stable connection parameters', async () => {
+  const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
+
+  const startParams = await nodeItDocker.start();
+  const firstRestartParams = await nodeItDocker.restart();
+  const secondRestartParams = await nodeItDocker.restart();
+
+  assert.deepEqual(firstRestartParams, startParams);
+  assert.deepEqual(secondRestartParams, startParams);
+  assert.equal(docker.calls.filter(([name]) => name === 'container.restart').length, 2);
+});
+
+test('start is idempotent when the container is already running', async () => {
+  const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
+
+  const first = await nodeItDocker.start();
+  const second = await nodeItDocker.start();
+
+  assert.deepEqual(second, first);
+  assert.equal(docker.calls.filter(([name]) => name === 'createContainer').length, 1);
+  assert.equal(docker.calls.filter(([name]) => name === 'container.start').length, 1);
+});
+
+test('stop removes the container even when stop fails and can be repeated', async () => {
+  const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
+
+  await nodeItDocker.start();
+  const container = docker.containers.get('node-it-container-qwerty12345');
+  container.stopError = new Error('already stopped');
+
+  await nodeItDocker.stop();
+  await nodeItDocker.stop();
+
+  assert.ok(docker.calls.some(([name]) => name === 'container.remove'));
+  assert.ok(docker.calls.some(([name]) => name === 'network.remove'));
+});
+
+test('two dynamic helpers use distinct container, network, and host port values', async () => {
+  const docker = createDockerStub();
+  const mysql = createMysqlStub();
+  const NodeItDocker = createNodeItDocker(docker, mysql, createLogger(), async () => {});
+
+  const first = NodeItDocker({ dynamicPort: true, verifyDbConnection: false });
+  const second = NodeItDocker({ dynamicPort: true, verifyDbConnection: false });
+
+  const firstParams = await first.start();
+  const secondParams = await second.start();
+
+  const createContainerCalls = docker.calls.filter(([name]) => name === 'createContainer');
+  const createNetworkCalls = docker.calls.filter(([name]) => name === 'createNetwork');
+
+  assert.notEqual(createContainerCalls[0][1].name, createContainerCalls[1][1].name);
+  assert.notEqual(createNetworkCalls[0][1].Name, createNetworkCalls[1][1].Name);
+  assert.notEqual(firstParams.port, secondParams.port);
+});
+
 test('cleans up and returns null when database verification fails', async () => {
   const docker = createDockerStub();
   const mysql = createMysqlStub({ failConnect: true });
@@ -334,5 +430,17 @@ test('cleans up and returns null when database verification fails', async () => 
 
   assert.equal(params, null);
   assert.ok(docker.calls.some(([name]) => name === 'container.remove'));
+  assert.ok(docker.calls.some(([name]) => name === 'network.remove'));
+});
+
+test('cleans up network when container creation fails', async () => {
+  const docker = createDockerStub();
+  docker.createContainerError = new Error('create failed');
+  const mysql = createMysqlStub();
+  const NodeItDocker = createNodeItDocker(docker, mysql, createLogger(), async () => {});
+  const nodeItDocker = NodeItDocker({ dynamicPort: true, verifyDbConnection: false });
+
+  await assert.rejects(() => nodeItDocker.start(), /create failed/);
+
   assert.ok(docker.calls.some(([name]) => name === 'network.remove'));
 });

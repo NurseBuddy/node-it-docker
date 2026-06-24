@@ -83,3 +83,16 @@ npm test
 
 The test suite uses mocked Docker and MySQL clients. It does not start a real
 Docker container.
+
+Run the optional Docker smoke before rolling a new helper version into service
+pilot branches:
+
+```bash
+npm run smoke:docker
+```
+
+The smoke starts `it-mysql-v2` with `dynamicPort: true`, verifies MySQL
+connectivity, exercises `restart()`, and then stops the container. It requires
+Docker access and access to the configured integration-test DB image. Use
+`IT_IMAGE_NAME` or `IT_MYSQL_IMAGE` to point at a locally available image if
+needed.

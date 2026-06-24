@@ -4,6 +4,7 @@
   "description": "Node Docker IT DB launcher",
   "main": "node-it-docker",
   "scripts": {
+    "smoke:docker": "node scripts/smoke-docker.js",
     "test": "node --test"
   },
   "author": "Nursebuddy",

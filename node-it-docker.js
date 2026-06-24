@@ -188,12 +188,18 @@ function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger =
     }
 
     async function stop() {
+      const container = dockerClient.getContainer(itContainerName);
+
       try {
-        const container = dockerClient.getContainer(itContainerName);
         await container.stop();
+      } catch (err) {
+        logger.warn('Failed to stop container:', err);
+      }
+
+      try {
         await container.remove({ force: true });
       } catch (err) {
-        logger.warn('Failed to stop or remove container:', err);
+        logger.warn('Failed to remove container:', err);
       }
 
       try {
@@ -211,45 +217,46 @@ function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger =
     async function start() {
       let container;
       let inspected;
-      const network = await getOrCreateNetwork(dockerClient, containerNetworkName, labels, logger);
 
       try {
+        const network = await getOrCreateNetwork(dockerClient, containerNetworkName, labels, logger);
         container = dockerClient.getContainer(itContainerName);
-        inspected = await container.inspect();
-      } catch {
-        logger.info('Creating container');
-        container = await dockerClient.createContainer({
-          Image: itImageName,
-          name: itContainerName,
-          Labels: labels,
-          ExposedPorts: {
-            [`${MYSQL_DEFAULT_PORT}/tcp`]: {},
-          },
-          HostConfig: {
-            PortBindings: {
-              [`${MYSQL_DEFAULT_PORT}/tcp`]: [{
-                HostIP: '0.0.0.0',
-                HostPort: isDynamicHostPort(configuredExternalPort) ? '' : `${configuredExternalPort}`,
-              }],
+
+        try {
+          inspected = await container.inspect();
+        } catch {
+          logger.info('Creating container');
+          container = await dockerClient.createContainer({
+            Image: itImageName,
+            name: itContainerName,
+            Labels: labels,
+            ExposedPorts: {
+              [`${MYSQL_DEFAULT_PORT}/tcp`]: {},
             },
-            Tmpfs: {
-              [dataDir]: 'rw,noexec,nosuid,size=600m',
-              '/tmp': 'rw,noexec,nosuid,size=50m',
-            },
-          },
-          NetworkingConfig: {
-            EndpointsConfig: {
-              [containerNetworkName]: {
-                Aliases: [itContainerName],
+            HostConfig: {
+              PortBindings: {
+                [`${MYSQL_DEFAULT_PORT}/tcp`]: [{
+                  HostIP: '0.0.0.0',
+                  HostPort: isDynamicHostPort(configuredExternalPort) ? '' : `${configuredExternalPort}`,
+                }],
+              },
+              Tmpfs: {
+                [dataDir]: 'rw,noexec,nosuid,size=600m',
+                '/tmp': 'rw,noexec,nosuid,size=50m',
               },
             },
-          },
-        });
-        container = dockerClient.getContainer(container.id);
-        logger.info(`Container '${container.id}' created.`);
-      }
+            NetworkingConfig: {
+              EndpointsConfig: {
+                [containerNetworkName]: {
+                  Aliases: [itContainerName],
+                },
+              },
+            },
+          });
+          container = dockerClient.getContainer(container.id);
+          logger.info(`Container '${container.id}' created.`);
+        }
 
-      try {
         if (!inspected || !inspected.State || !inspected.State.Running) {
           await container.start();
         }
