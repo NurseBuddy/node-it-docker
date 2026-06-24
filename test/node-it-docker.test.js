@@ -15,17 +15,25 @@ function createLogger() {
 
 function createMysqlStub({ failConnect = false } = {}) {
   const connections = [];
-  return {
+  const mysqlStub = {
     connections,
-    createConnection: config => {
+    failConnectCount: failConnect ? Number.POSITIVE_INFINITY : 0,
+    createConnection(config) {
       connections.push(config);
       return {
-        connect: cb => cb(failConnect ? new Error('connect failed') : null),
+        connect: (cb) => {
+          if (mysqlStub.failConnectCount > 0) {
+            mysqlStub.failConnectCount -= 1;
+            return cb(new Error('connect failed'));
+          }
+          return cb(null);
+        },
         query: (sql, cb) => cb(null, [{ id: 1 }]),
         destroy: () => {},
       };
     },
   };
+  return mysqlStub;
 }
 
 function createDockerStub() {
@@ -396,6 +404,24 @@ test('falls back to start when restart fails without using method this binding',
   assert.deepEqual(
     docker.calls.filter(([name]) => ['container.restart', 'container.start'].includes(name)).map(([name]) => name),
     ['container.start', 'container.restart', 'container.start'],
+  );
+});
+
+test('falls back to start when restart verification fails', async () => {
+  const { docker, mysql, nodeItDocker } = createSubject({ dynamicPort: true });
+
+  const startParams = await nodeItDocker.start();
+  const originalContainer = Array.from(docker.containers.values())
+    .find(item => item.createOptions && item.createOptions.name.startsWith('node-it-container-'));
+
+  mysql.failConnectCount = 10;
+  const restartParams = await nodeItDocker.restart();
+
+  assert.notEqual(restartParams.port, startParams.port);
+  assert.equal(originalContainer.removed, true);
+  assert.deepEqual(
+    docker.calls.filter(([name]) => ['container.restart', 'container.stop', 'container.remove', 'container.start'].includes(name)).map(([name]) => name),
+    ['container.start', 'container.restart', 'container.stop', 'container.remove', 'container.start'],
   );
 });
 

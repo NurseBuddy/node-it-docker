@@ -300,7 +300,8 @@ function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger =
         if (await verifyDatabaseConnection(verifyDbConnection, mysqlClient, resolvedExternalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stop, logger, sleepFn)) {
           return getDbConnectionParameters();
         }
-        return null;
+        logger.warn('Restart verification failed, starting new container.');
+        return start();
       } catch (err) {
         logger.warn('Restart failed, starting new container.', err);
         await stop();
