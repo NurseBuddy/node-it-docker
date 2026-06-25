@@ -38,6 +38,13 @@ function queryFlag(connectionParams) {
 
     await queryFlag(db);
 
+    const reset = await nodeItDocker.resetDatabase();
+    if (!reset || !reset.host || !reset.port) {
+      throw new Error('resetDatabase() did not return usable DB parameters');
+    }
+
+    await queryFlag(reset);
+
     const restarted = await nodeItDocker.restart();
     if (!restarted || !restarted.host || !restarted.port) {
       throw new Error('restart() did not return usable DB parameters');

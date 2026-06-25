@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { Readable } = require('node:stream');
 const test = require('node:test');
 
 const { createNodeItDocker } = require('../node-it-docker');
@@ -91,6 +92,7 @@ function createDockerStub() {
       removed: false,
       stopError: null,
       restartError: null,
+      execResults: [],
       async inspect() {
         calls.push(['container.inspect', name]);
         if (this.removed) {
@@ -134,6 +136,23 @@ function createDockerStub() {
           throw this.restartError;
         }
         this.started = true;
+      },
+      async exec(options) {
+        calls.push(['container.exec', name, options]);
+        const result = this.execResults.length > 0
+          ? this.execResults.shift()
+          : { exitCode: 0, stdout: '' };
+
+        return {
+          async start() {
+            calls.push(['exec.start', name, options.Cmd]);
+            return Readable.from([result.stdout || '', result.stderr || '']);
+          },
+          async inspect() {
+            calls.push(['exec.inspect', name, options.Cmd]);
+            return { ExitCode: result.exitCode || 0 };
+          },
+        };
       },
     };
   }
@@ -208,6 +227,10 @@ function createDockerStub() {
         },
         async restart() {
           calls.push(['container.restart', nameOrId]);
+          throw new Error('not found');
+        },
+        async exec() {
+          calls.push(['container.exec', nameOrId]);
           throw new Error('not found');
         },
       };
@@ -435,6 +458,34 @@ test('successful restart returns stable connection parameters', async () => {
   assert.deepEqual(firstRestartParams, startParams);
   assert.deepEqual(secondRestartParams, startParams);
   assert.equal(docker.calls.filter(([name]) => name === 'container.restart').length, 2);
+});
+
+test('resetDatabase uses the SQL reset script and returns stable connection parameters', async () => {
+  const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
+
+  const startParams = await nodeItDocker.start();
+  const resetParams = await nodeItDocker.resetDatabase();
+
+  assert.deepEqual(resetParams, startParams);
+  assert.deepEqual(
+    docker.calls.find(([name]) => name === 'container.exec')[2].Cmd,
+    ['/usr/local/bin/reset-nursebuddy-db', 'nursebuddy'],
+  );
+  assert.equal(docker.calls.filter(([name]) => name === 'container.restart').length, 0);
+});
+
+test('resetDatabase falls back to restart when the SQL reset script is unavailable', async () => {
+  const { docker, nodeItDocker } = createSubject({ verifyDbConnection: false });
+
+  const startParams = await nodeItDocker.start();
+  const container = docker.containers.get('node-it-container-qwerty12345');
+  container.execResults.push({ exitCode: 127, stderr: 'reset-nursebuddy-db: not found' });
+
+  const resetParams = await nodeItDocker.resetDatabase();
+
+  assert.deepEqual(resetParams, startParams);
+  assert.equal(docker.calls.filter(([name]) => name === 'container.exec').length, 1);
+  assert.equal(docker.calls.filter(([name]) => name === 'container.restart').length, 1);
 });
 
 test('start is idempotent when the container is already running', async () => {

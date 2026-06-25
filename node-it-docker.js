@@ -1,5 +1,6 @@
 'use strict';
 
+const { Writable } = require('stream');
 const Docker = require('dockerode');
 const pino = require('pino');
 const mysql = require('mysql');
@@ -16,6 +17,7 @@ const DEFAULT_IT_IMAGE_NAME = '989173062527.dkr.ecr.eu-west-1.amazonaws.com/it-m
 const DEFAULT_IT_CONTAINER_NAME = 'node-it-container-qwerty12345';
 const DEFAULT_CONTAINER_NETWORK_NAME = 'node-it-test-net';
 const DEFAULT_EXTERNAL_PORT = 3806;
+const RESET_SCRIPT_PATH = '/usr/local/bin/reset-nursebuddy-db';
 
 async function sleep(timeMs) {
   return new Promise(resolve => setTimeout(resolve, timeMs));
@@ -168,6 +170,69 @@ async function resolveExternalPort(container, externalPort, currentContainerId) 
   return bindings[0].HostPort;
 }
 
+function collectExecOutput(dockerClient, stream) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+
+    const stdoutStream = new Writable({
+      write(chunk, encoding, callback) {
+        stdout += chunk.toString();
+        callback();
+      },
+    });
+    const stderrStream = new Writable({
+      write(chunk, encoding, callback) {
+        stderr += chunk.toString();
+        callback();
+      },
+    });
+
+    stream.on('end', () => resolve({ stdout, stderr }));
+    stream.on('error', reject);
+
+    if (dockerClient.modem && typeof dockerClient.modem.demuxStream === 'function') {
+      dockerClient.modem.demuxStream(stream, stdoutStream, stderrStream);
+      return;
+    }
+
+    stream.on('data', chunk => {
+      stdout += chunk.toString();
+    });
+  });
+}
+
+async function execInContainer(dockerClient, container, cmd) {
+  const exec = await container.exec({
+    Cmd: cmd,
+    AttachStdout: true,
+    AttachStderr: true,
+  });
+
+  const stream = await exec.start({ hijack: true, stdin: false });
+  const output = await collectExecOutput(dockerClient, stream);
+  const inspected = await exec.inspect();
+
+  if (inspected.ExitCode !== 0) {
+    const err = new Error(`Container command failed with exit code ${inspected.ExitCode}: ${cmd.join(' ')}`);
+    err.exitCode = inspected.ExitCode;
+    err.stdout = output.stdout;
+    err.stderr = output.stderr;
+    throw err;
+  }
+
+  return output;
+}
+
+function isResetScriptUnavailable(err) {
+  const output = `${err.stdout || ''}\n${err.stderr || ''}\n${err.message || ''}`;
+
+  return err.exitCode === 66
+    || err.exitCode === 126
+    || err.exitCode === 127
+    || /Missing \/baseline\.sql|No such file|not found|executable file not found/i.test(output);
+}
+
 function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger = log, sleepFn = sleep) {
   return function NodeItDocker(options = {}) {
     const runId = createRunId();
@@ -309,10 +374,36 @@ function createNodeItDocker(dockerClient = docker, mysqlClient = mysql, logger =
       }
     }
 
+    async function resetDatabase() {
+      if (dbName !== 'nursebuddy') {
+        logger.warn(`SQL reset only supports the nursebuddy database, falling back to container restart for '${dbName}'.`);
+        return restart();
+      }
+
+      try {
+        const container = dockerClient.getContainer(itContainerName);
+        await execInContainer(dockerClient, container, [RESET_SCRIPT_PATH, dbName]);
+        resolvedExternalPort = await resolveExternalPort(container, configuredExternalPort, currentContainerId);
+        if (await verifyDatabaseConnection(verifyDbConnection, mysqlClient, resolvedExternalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stop, logger, sleepFn)) {
+          return getDbConnectionParameters();
+        }
+        logger.warn('SQL reset verification failed, falling back to container restart.');
+        return restart();
+      } catch (err) {
+        if (isResetScriptUnavailable(err)) {
+          logger.warn('SQL reset script is unavailable in the IT DB image, falling back to container restart.', err);
+        } else {
+          logger.warn('SQL reset failed, falling back to container restart.', err);
+        }
+        return restart();
+      }
+    }
+
     return {
       stop,
       start,
       restart,
+      resetDatabase,
       getDbConnectionParameters: async () => getDbConnectionParameters(),
     };
   };

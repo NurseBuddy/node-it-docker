@@ -25,6 +25,10 @@ const db = await nodeItDocker.start();
 
 // Configure the service under test with db.host, db.port, db.user,
 // db.password, and db.database.
+//
+// DB-heavy suites can restore the baseline database without restarting the
+// Docker container when the IT DB image supports it:
+// await nodeItDocker.resetDatabase();
 
 await nodeItDocker.stop();
 ```
@@ -75,6 +79,11 @@ Services updated under NB-9161 should opt in to dynamic behavior with
 `dynamicPort: true`. A future major version can make dynamic behavior the
 default after all consumers have moved away from the legacy fixed port.
 
+`resetDatabase()` is an opt-in faster reset for suites that need a full
+database baseline between groups of tests. It calls the reset script baked into
+newer IT DB images and falls back to the legacy container `restart()` path when
+running against an older image.
+
 ## Testing
 
 ```bash
@@ -92,7 +101,7 @@ npm run smoke:docker
 ```
 
 The smoke starts `it-mysql-v2` with `dynamicPort: true`, verifies MySQL
-connectivity, exercises `restart()`, and then stops the container. It requires
-Docker access and access to the configured integration-test DB image. Use
-`IT_IMAGE_NAME` or `IT_MYSQL_IMAGE` to point at a locally available image if
-needed.
+connectivity, exercises `resetDatabase()` and `restart()`, and then stops the
+container. It requires Docker access and access to the configured
+integration-test DB image. Use `IT_IMAGE_NAME` or `IT_MYSQL_IMAGE` to point at a
+locally available image if needed.
