@@ -146,7 +146,10 @@ function createDockerStub() {
         return {
           async start() {
             calls.push(['exec.start', name, options.Cmd]);
-            return Readable.from([result.stdout || '', result.stderr || '']);
+            const stream = Readable.from([]);
+            stream.stdoutData = result.stdout || '';
+            stream.stderrData = result.stderr || '';
+            return stream;
           },
           async inspect() {
             calls.push(['exec.inspect', name, options.Cmd]);
@@ -162,6 +165,17 @@ function createDockerStub() {
     containers,
     networks,
     createContainerError: null,
+    modem: {
+      demuxStream(stream, stdout, stderr) {
+        if (stream.stdoutData) {
+          stdout.write(stream.stdoutData);
+        }
+        if (stream.stderrData) {
+          stderr.write(stream.stderrData);
+        }
+        stream.resume();
+      },
+    },
     async listNetworks() {
       calls.push(['listNetworks']);
       return Array.from(networks.values()).map(network => ({ Id: network.id, Name: network.name }));
@@ -437,7 +451,7 @@ test('falls back to start when restart verification fails', async () => {
   const originalContainer = Array.from(docker.containers.values())
     .find(item => item.createOptions && item.createOptions.name.startsWith('node-it-container-'));
 
-  mysql.failConnectCount = 10;
+  mysql.failConnectCount = 120;
   const restartParams = await nodeItDocker.restart();
 
   assert.notEqual(restartParams.port, startParams.port);
@@ -458,6 +472,24 @@ test('successful restart returns stable connection parameters', async () => {
   assert.deepEqual(firstRestartParams, startParams);
   assert.deepEqual(secondRestartParams, startParams);
   assert.equal(docker.calls.filter(([name]) => name === 'container.restart').length, 2);
+});
+
+test('database readiness polling retries quickly while MySQL starts', async () => {
+  const mysql = createMysqlStub();
+  const sleepPeriods = [];
+  mysql.failConnectCount = 3;
+
+  const { nodeItDocker } = createSubject({}, {
+    mysql,
+    sleep: async (timeMs) => {
+      sleepPeriods.push(timeMs);
+    },
+  });
+
+  const params = await nodeItDocker.start();
+
+  assert.ok(params);
+  assert.deepEqual(sleepPeriods, [100, 100, 100]);
 });
 
 test('resetDatabase uses the SQL reset script and returns stable connection parameters', async () => {

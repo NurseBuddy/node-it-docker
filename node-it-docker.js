@@ -18,6 +18,7 @@ const DEFAULT_IT_CONTAINER_NAME = 'node-it-container-qwerty12345';
 const DEFAULT_CONTAINER_NETWORK_NAME = 'node-it-test-net';
 const DEFAULT_EXTERNAL_PORT = 3806;
 const RESET_SCRIPT_PATH = '/usr/local/bin/reset-nursebuddy-db';
+const VERIFY_DB_CONNECTION_MAX_ATTEMPTS = 120;
 
 async function sleep(timeMs) {
   return new Promise(resolve => setTimeout(resolve, timeMs));
@@ -121,16 +122,25 @@ async function connect(mysqlClient, externalPort, currentContainerId, itContaine
   });
 }
 
+function getVerifySleepMs(attempt) {
+  if (attempt < 10) {
+    return 100;
+  }
+  if (attempt < 30) {
+    return 250;
+  }
+  return 500;
+}
+
 async function verifyDatabaseConnection(verifyDbConnection, mysqlClient, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName, stopFn, logger, sleepFn) {
   let lastError;
-  let waitPeriod = 500;
   const start = Date.now();
 
   if (!verifyDbConnection) {
     return true;
   }
 
-  for (let i = 0; i < 10; i++) {
+  for (let attempt = 0; attempt < VERIFY_DB_CONNECTION_MAX_ATTEMPTS; attempt++) {
     try {
       if (await connect(mysqlClient, externalPort, currentContainerId, itContainerName, dbUsername, dbPassword, dbName)) {
         logger.info(`DB Connection verified in : ${Date.now() - start} ms.`);
@@ -139,8 +149,9 @@ async function verifyDatabaseConnection(verifyDbConnection, mysqlClient, externa
     } catch (err) {
       lastError = err;
     }
-    await sleepFn(waitPeriod);
-    waitPeriod += Math.round(waitPeriod / 2);
+    if (attempt < VERIFY_DB_CONNECTION_MAX_ATTEMPTS - 1) {
+      await sleepFn(getVerifySleepMs(attempt));
+    }
   }
 
   logger.warn({ msg: 'DB connection failed:', error: lastError });
